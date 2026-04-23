@@ -10,24 +10,39 @@ This repository contains a simple Streamlit chat application designed for deploy
 
 ## How the app works
 
-- Databricks Apps injects `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` for the app service principal automatically.
 - You add a Genie space as an app resource in the Databricks Apps UI.
 - `app.yaml` maps that resource to `GENIE_SPACE_ID` using `valueFrom: genie-space`.
-- The Streamlit app uses `WorkspaceClient()` to start a Genie conversation and send follow-up messages in the same thread.
+- In Databricks Apps, the Streamlit app prefers user authorization by reading the forwarded `x-forwarded-access-token` header.
+- If no forwarded user token is available, the app falls back to the app service principal credentials injected by Databricks Apps.
+- The app uses `WorkspaceClient()` to start a Genie conversation and send follow-up messages in the same thread.
 
 ## Local development
 
-To run this outside Databricks Apps, provide the Databricks host, OAuth client credentials, and the Genie space ID as environment variables.
+To run this outside Databricks Apps, provide the Databricks host and Genie space ID, then choose one auth method:
+
+- User-style token auth: set `DATABRICKS_TOKEN`
+- App/service-principal auth: set `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 $env:DATABRICKS_HOST="https://<your-workspace-host>"
-$env:DATABRICKS_CLIENT_ID="<oauth-client-id>"
-$env:DATABRICKS_CLIENT_SECRET="<oauth-client-secret>"
 $env:GENIE_SPACE_ID="<genie-space-id>"
 streamlit run app.py
+```
+
+Example using a local token:
+
+```powershell
+$env:DATABRICKS_TOKEN="<user-access-token-or-pat>"
+```
+
+Example using app credentials:
+
+```powershell
+$env:DATABRICKS_CLIENT_ID="<oauth-client-id>"
+$env:DATABRICKS_CLIENT_SECRET="<oauth-client-secret>"
 ```
 
 ## Push to GitHub
@@ -48,13 +63,19 @@ git push -u origin main
 3. Choose **Git repository** as the source and select your GitHub repo and branch.
 4. In the app configuration step, add a **Genie space** resource.
 5. Use the default resource key `genie-space`, or update `app.yaml` if you choose a different key.
-6. Grant the app `Can run` on the Genie space.
-7. Make sure the app service principal also has the required data permissions on the underlying Unity Catalog objects.
-8. Deploy the app.
+6. Under **User authorization**, add the scopes your app needs. For this sample, use `dashboards.genie` and the Unity Catalog read scopes required by your workspace policy.
+7. Restart or redeploy the app after enabling or changing user authorization scopes.
+8. Deploy the app and grant user consent if prompted.
 
 ## Required permissions
 
-The app service principal typically needs:
+Signed-in users typically need:
+
+- access to the app itself
+- access to the Genie space
+- `SELECT` on the Unity Catalog tables or views used by the Genie space
+
+If the app falls back to app authorization, the app service principal typically needs:
 
 - `Can run` on the Genie space
 - `USE CATALOG` on the relevant catalog
@@ -63,6 +84,6 @@ The app service principal typically needs:
 
 ## Notes
 
-- This sample uses app authorization, not per-user authorization.
+- This sample prefers per-user authorization in Databricks Apps.
 - The app keeps the Genie `conversation_id` in Streamlit session state so follow-up questions stay in context.
 - If Genie returns SQL, the UI shows the generated query and attempts to preview the first available result chunk.

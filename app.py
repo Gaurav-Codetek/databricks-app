@@ -25,7 +25,31 @@ st.set_page_config(
 )
 
 
-@st.cache_resource(show_spinner=False)
+def get_forwarded_user_token() -> str:
+    headers = getattr(st.context, "headers", None)
+    if not headers:
+        return ""
+
+    token = headers.get("x-forwarded-access-token", "")
+    return token.strip() if token else ""
+
+
+def get_auth_mode() -> str:
+    host = os.getenv("DATABRICKS_HOST", "").strip()
+    user_token = get_forwarded_user_token()
+    client_id = os.getenv("DATABRICKS_CLIENT_ID", "").strip()
+    client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "").strip()
+    token = os.getenv("DATABRICKS_TOKEN", "").strip()
+
+    if host and user_token:
+        return "user-authorization"
+    if host and client_id and client_secret:
+        return "app-authorization"
+    if host and token:
+        return "token-fallback"
+    return "auto-detect"
+
+
 def get_workspace_client() -> WorkspaceClient:
     """
     Build a Databricks Workspace client.
@@ -38,7 +62,7 @@ def get_workspace_client() -> WorkspaceClient:
     host = os.getenv("DATABRICKS_HOST", "").strip()
 
     # Databricks Apps user authorization forwards the signed-in user's token.
-    forwarded_user_token = st.context.headers.get("x-forwarded-access-token")
+    forwarded_user_token = get_forwarded_user_token()
 
     if host and forwarded_user_token:
         return WorkspaceClient(
@@ -471,7 +495,8 @@ def render_chat_history() -> None:
 def render_auth_debug() -> None:
     st.subheader("Auth Debug")
 
-    forwarded_user_token = st.context.headers.get("x-forwarded-access-token")
+    forwarded_user_token = get_forwarded_user_token()
+    st.write("Auth mode:", get_auth_mode())
     st.write("User token present:", bool(forwarded_user_token))
 
     try:
@@ -499,6 +524,7 @@ with st.sidebar:
     st.subheader("Connection")
     st.write(f"App: `{app_name}`")
     st.write(f"Workspace: `{workspace_host}`")
+    st.write(f"Auth mode: `{get_auth_mode()}`")
     if space_id:
         st.success(f"Genie space ready: `{space_id}`")
     else:
