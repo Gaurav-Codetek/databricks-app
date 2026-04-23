@@ -125,6 +125,16 @@ def summarize_error(error: Any) -> str | None:
     return None
 
 
+def error_type(error: Any) -> str | None:
+    payload = serialize_value(error)
+    if isinstance(payload, dict):
+        for key in ("error_type", "type", "error_code"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def deduplicate(items: list[str]) -> list[str]:
     seen: set[str] = set()
     unique_items: list[str] = []
@@ -233,9 +243,12 @@ def build_assistant_message(
 
     content = "\n\n".join(part for part in text_parts if part).strip()
     error_summary = summarize_error(getattr(response, "error", None))
+    error_kind = error_type(getattr(response, "error", None))
 
     if not content and error_summary:
         content = error_summary
+    if not content and error_kind:
+        content = f"Genie returned an error: {error_kind}"
     if not content and sql_blocks:
         content = (
             "Genie generated SQL for this request. Expand the section below to "
@@ -249,11 +262,32 @@ def build_assistant_message(
         "content": content,
         "status": serialize_value(getattr(response, "status", None)),
         "error": serialize_value(getattr(response, "error", None)),
+        "error_type": error_kind,
         "conversation_id": conversation_id,
         "message_id": message_id,
         "sql_blocks": sql_blocks,
         "suggestions": deduplicate(suggested_questions)[:4],
     }
+
+
+def fetch_failed_message(
+    client: WorkspaceClient,
+    *,
+    space_id: str,
+    conversation_id: str | None,
+    message_id: str | None,
+) -> Any | None:
+    if not conversation_id or not message_id:
+        return None
+
+    try:
+        return client.genie.get_message(
+            space_id=space_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def ask_genie(prompt: str) -> dict[str, Any]:
@@ -268,18 +302,39 @@ def ask_genie(prompt: str) -> dict[str, Any]:
     conversation_id = st.session_state.get("conversation_id")
 
     if conversation_id:
-        response = client.genie.create_message_and_wait(
+        waiter = client.genie.create_message(
             space_id=space_id,
             conversation_id=conversation_id,
             content=prompt,
-            timeout=REQUEST_TIMEOUT,
         )
     else:
-        response = client.genie.start_conversation_and_wait(
+        waiter = client.genie.start_conversation(
             space_id=space_id,
             content=prompt,
-            timeout=REQUEST_TIMEOUT,
         )
+
+    waiter_conversation_id = getattr(waiter, "conversation_id", None) or conversation_id
+    waiter_message_id = getattr(waiter, "message_id", None)
+
+    if waiter_conversation_id:
+        st.session_state["conversation_id"] = waiter_conversation_id
+
+    try:
+        response = waiter.result(timeout=REQUEST_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        failed_response = fetch_failed_message(
+            client,
+            space_id=space_id,
+            conversation_id=waiter_conversation_id,
+            message_id=waiter_message_id,
+        )
+        if failed_response is not None:
+            return build_assistant_message(
+                client,
+                space_id=space_id,
+                response=failed_response,
+            )
+        raise RuntimeError(str(exc)) from exc
 
     new_conversation_id = conversation_id_for(response)
     if new_conversation_id:
@@ -337,6 +392,12 @@ def render_query_block(block: dict[str, Any], block_index: int) -> None:
 
 def render_assistant_message(message: dict[str, Any], message_index: int) -> None:
     st.markdown(message["content"])
+
+    if message.get("status") and message.get("status") != "COMPLETED":
+        st.caption(f"Message status: {message['status']}")
+
+    if message.get("error_type"):
+        st.caption(f"Error type: `{message['error_type']}`")
 
     error_message = summarize_error(message.get("error"))
     if error_message and error_message != message["content"]:
