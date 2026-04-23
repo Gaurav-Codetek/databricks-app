@@ -27,6 +27,46 @@ st.set_page_config(
 
 @st.cache_resource(show_spinner=False)
 def get_workspace_client() -> WorkspaceClient:
+    """
+    Build a Databricks Workspace client.
+
+    Priority:
+    1. User authorization via forwarded access token
+    2. App/service-principal authorization as fallback
+    3. SDK default resolution as last fallback
+    """
+    host = os.getenv("DATABRICKS_HOST", "").strip()
+
+    # Databricks Apps user authorization forwards the signed-in user's token.
+    forwarded_user_token = st.context.headers.get("x-forwarded-access-token")
+
+    if host and forwarded_user_token:
+        return WorkspaceClient(
+            host=host,
+            token=forwarded_user_token,
+            auth_type="pat",
+        )
+
+    # Fallback to app identity if user token is unavailable.
+    client_id = os.getenv("DATABRICKS_CLIENT_ID", "").strip()
+    client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "").strip()
+    token = os.getenv("DATABRICKS_TOKEN", "").strip()
+
+    if host and client_id and client_secret:
+        return WorkspaceClient(
+            host=host,
+            client_id=client_id,
+            client_secret=client_secret,
+            auth_type="oauth-m2m",
+        )
+
+    if host and token:
+        return WorkspaceClient(
+            host=host,
+            token=token,
+            auth_type="pat",
+        )
+
     return WorkspaceClient()
 
 
@@ -428,6 +468,20 @@ def render_chat_history() -> None:
                 st.markdown(message["content"])
 
 
+def render_auth_debug() -> None:
+    st.subheader("Auth Debug")
+
+    forwarded_user_token = st.context.headers.get("x-forwarded-access-token")
+    st.write("User token present:", bool(forwarded_user_token))
+
+    try:
+        me = get_workspace_client().current_user.me()
+        st.write("Current caller:")
+        st.json(serialize_value(me))
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error fetching identity: {exc}")
+
+
 initialize_state()
 
 space_id = os.getenv(SPACE_ID_ENV, "").strip()
@@ -450,6 +504,8 @@ with st.sidebar:
     else:
         st.error("GENIE_SPACE_ID is missing")
 
+    render_auth_debug()
+
     st.subheader("Try a prompt")
     for prompt in DEFAULT_PROMPTS:
         if st.button(prompt, key=f"default-prompt-{prompt}", use_container_width=True):
@@ -468,9 +524,9 @@ if not space_id:
         "in the app configuration and map it to `GENIE_SPACE_ID` in `app.yaml`."
     )
     st.info(
-        "Resource key expected by this sample: `genie-space`. Grant the app "
-        "`Can run` on the Genie space and the required Unity Catalog privileges "
-        "on the underlying data."
+        "Resource key expected by this sample: `genie-space`. Make sure the app "
+        "has user authorization enabled and that signed-in users have the required "
+        "Unity Catalog privileges on the underlying data."
     )
     st.stop()
 
