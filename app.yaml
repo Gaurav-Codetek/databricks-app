@@ -1,0 +1,9 @@
+command:
+  - streamlit
+  - run
+  - app.py
+env:
+  - name: GENIE_SPACE_ID
+    valueFrom: genie-space
+  - name: STREAMLIT_GATHER_USAGE_STATS
+    value: "false"
