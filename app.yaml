@@ -5,5 +5,7 @@ command:
 env:
   - name: GENIE_SPACE_ID
     valueFrom: genie-space
-  - name: STREAMLIT_GATHER_USAGE_STATS
-    value: "false"
+  - name: DATABRICKS_HOST
+    value: "https://adb-8187118582959821.1.azuredatabricks.net"
+  - name: DATABRICKS_TOKEN
+    valueFrom: secret
