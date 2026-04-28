@@ -6,12 +6,9 @@ command:
   - --server.port=8000
 
 env:
-  - name: GENIE_SPACE_ID
-    valueFrom: genie-space
+  - name: SERVING_ENDPOINT
+    valueFrom: serving-endpoint
+  - name: AGENT_REQUEST_FORMAT
+    value: responses
   - name: STREAMLIT_GATHER_USAGE_STATS
     value: "false"
-
-permissions:
-  scopes:
-    - sql
-    - dashboards.genie

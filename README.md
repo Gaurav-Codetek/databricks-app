@@ -1,24 +1,40 @@
-# Databricks Apps Genie Chat Sample
+# Databricks Apps Supervisor Agent Chat
 
-This repository contains a simple Streamlit chat application designed for deployment on the Databricks Apps platform through a GitHub repository. The app uses a Databricks Genie space as an app resource and talks to it with the Databricks Python SDK.
+This repository contains a simple Streamlit chat application designed for deployment on the Databricks Apps platform through a GitHub repository. The app uses a Databricks model serving endpoint resource, such as a deployed supervisor agent endpoint.
 
 ## Included files
 
-- `app.py`: Streamlit chat UI with conversation memory, SQL inspection, and query-result preview.
-- `app.yaml`: Databricks Apps runtime config that starts Streamlit and injects the Genie space ID.
+- `app.py`: Streamlit chat UI with conversation memory and Databricks serving endpoint invocation.
+- `app.yaml`: Databricks Apps runtime config that starts Streamlit and injects the serving endpoint name.
 - `requirements.txt`: Python dependencies installed during deployment.
 
 ## How the app works
 
-- You add a Genie space as an app resource in the Databricks Apps UI.
-- `app.yaml` maps that resource to `GENIE_SPACE_ID` using `valueFrom: genie-space`.
+- You add a serving endpoint as an app resource in the Databricks Apps UI.
+- `app.yaml` maps that resource to `SERVING_ENDPOINT` using `valueFrom: serving-endpoint`.
 - In Databricks Apps, the Streamlit app prefers user authorization by reading the forwarded `x-forwarded-access-token` header.
 - If no forwarded user token is available, the app falls back to the app service principal credentials injected by Databricks Apps.
-- The app uses `WorkspaceClient()` to start a Genie conversation and send follow-up messages in the same thread.
+- The app posts chat history to `/serving-endpoints/<endpoint-name>/invocations`.
+
+By default, requests use the Databricks agent `ResponsesAgent` style payload:
+
+```json
+{
+  "input": [
+    {"role": "user", "content": "Your question"}
+  ]
+}
+```
+
+If your endpoint expects a different payload, set `AGENT_REQUEST_FORMAT` in `app.yaml`:
+
+- `responses`: sends `{"input": messages}`.
+- `chat`: sends `{"messages": messages}`.
+- `inputs`: sends `{"inputs": {"prompt": latest_prompt, "messages": messages}}`.
 
 ## Local development
 
-To run this outside Databricks Apps, provide the Databricks host and Genie space ID, then choose one auth method:
+To run this outside Databricks Apps, provide the Databricks host and serving endpoint name, then choose one auth method:
 
 - User-style token auth: set `DATABRICKS_TOKEN`
 - App/service-principal auth: set `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`
@@ -28,7 +44,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 $env:DATABRICKS_HOST="https://<your-workspace-host>"
-$env:GENIE_SPACE_ID="<genie-space-id>"
+$env:SERVING_ENDPOINT="<serving-endpoint-name>"
 streamlit run app.py
 ```
 
@@ -45,45 +61,21 @@ $env:DATABRICKS_CLIENT_ID="<oauth-client-id>"
 $env:DATABRICKS_CLIENT_SECRET="<oauth-client-secret>"
 ```
 
-## Push to GitHub
-
-```powershell
-git init
-git add .
-git commit -m "Add Databricks Apps Genie chat sample"
-git branch -M main
-git remote add origin https://github.com/<your-org>/<your-repo>.git
-git push -u origin main
-```
-
 ## Deploy on Databricks Apps
 
 1. Push this folder to a GitHub repository.
-2. In your Databricks workspace, open **Apps** and create a new app.
+2. In your Databricks workspace, open **Apps** and create or edit your app.
 3. Choose **Git repository** as the source and select your GitHub repo and branch.
-4. In the app configuration step, add a **Genie space** resource.
-5. Use the default resource key `genie-space`, or update `app.yaml` if you choose a different key.
-6. Under **User authorization**, add the scopes your app needs. For this sample, use `dashboards.genie` and the Unity Catalog read scopes required by your workspace policy.
-7. Restart or redeploy the app after enabling or changing user authorization scopes.
-8. Deploy the app and grant user consent if prompted.
+4. In the app configuration step, add a **Serving endpoint** resource.
+5. Grant the app `Can query` on the endpoint.
+6. Use the default resource key `serving-endpoint`, or update `app.yaml` if you choose a different key.
+7. Deploy or restart the app after changing resource configuration.
 
 ## Required permissions
 
-Signed-in users typically need:
+The app service principal typically needs:
 
-- access to the app itself
-- access to the Genie space
-- `SELECT` on the Unity Catalog tables or views used by the Genie space
+- `Can query` on the serving endpoint
+- any downstream data or tool permissions required by the deployed supervisor agent itself
 
-If the app falls back to app authorization, the app service principal typically needs:
-
-- `Can run` on the Genie space
-- `USE CATALOG` on the relevant catalog
-- `USE SCHEMA` on the relevant schema
-- `SELECT` on the tables or views queried by the Genie space
-
-## Notes
-
-- This sample prefers per-user authorization in Databricks Apps.
-- The app keeps the Genie `conversation_id` in Streamlit session state so follow-up questions stay in context.
-- If Genie returns SQL, the UI shows the generated query and attempts to preview the first available result chunk.
+Signed-in users need access to the app. If you keep user authorization enabled and want the endpoint call to run as the signed-in user, those users also need permission to query the endpoint.

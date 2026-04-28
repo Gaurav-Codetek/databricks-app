@@ -1,25 +1,24 @@
 from __future__ import annotations
 
 import os
-from datetime import timedelta
 from typing import Any
 
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 
 
-SPACE_ID_ENV = "GENIE_SPACE_ID"
-REQUEST_TIMEOUT = timedelta(minutes=3)
-PREVIEW_ROW_LIMIT = 50
+ENDPOINT_ENV = "SERVING_ENDPOINT"
+REQUEST_FORMAT_ENV = "AGENT_REQUEST_FORMAT"
+DEFAULT_REQUEST_FORMAT = "responses"
 DEFAULT_PROMPTS = [
-    "What are the top 10 products by revenue this quarter?",
-    "Show weekly sales trend for the last 8 weeks.",
-    "Which regions are underperforming versus target this month?",
+    "Summarize current business performance.",
+    "What should I look at first today?",
+    "Find the biggest risks and recommended next actions.",
 ]
 
 
 st.set_page_config(
-    page_title="Genie Chat App",
+    page_title="Supervisor Agent Chat",
     page_icon=":speech_balloon:",
     layout="wide",
 )
@@ -60,8 +59,6 @@ def get_workspace_client() -> WorkspaceClient:
     3. SDK default resolution as last fallback
     """
     host = os.getenv("DATABRICKS_HOST", "").strip()
-
-    # Databricks Apps user authorization forwards the signed-in user's token.
     forwarded_user_token = get_forwarded_user_token()
 
     if host and forwarded_user_token:
@@ -71,7 +68,6 @@ def get_workspace_client() -> WorkspaceClient:
             auth_type="pat",
         )
 
-    # Fallback to app identity if user token is unavailable.
     client_id = os.getenv("DATABRICKS_CLIENT_ID", "").strip()
     client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "").strip()
     token = os.getenv("DATABRICKS_TOKEN", "").strip()
@@ -96,14 +92,14 @@ def get_workspace_client() -> WorkspaceClient:
 
 def initialize_state() -> None:
     st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("conversation_id", None)
     st.session_state.setdefault("pending_prompt", None)
+    st.session_state.setdefault("last_raw_response", None)
 
 
 def reset_chat() -> None:
     st.session_state["messages"] = []
-    st.session_state["conversation_id"] = None
     st.session_state["pending_prompt"] = None
+    st.session_state["last_raw_response"] = None
 
 
 def serialize_value(value: Any) -> Any:
@@ -134,341 +130,153 @@ def serialize_value(value: Any) -> Any:
     return str(value)
 
 
-def message_id_for(message: Any) -> str | None:
-    return getattr(message, "message_id", None) or getattr(message, "id", None)
-
-
-def conversation_id_for(message: Any) -> str | None:
-    return getattr(message, "conversation_id", None)
-
-
-def flatten_strings(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        cleaned = value.strip()
-        return [cleaned] if cleaned else []
-    if isinstance(value, (int, float, bool)):
-        return []
-    if isinstance(value, list):
-        flattened: list[str] = []
-        for item in value:
-            flattened.extend(flatten_strings(item))
-        return flattened
-    if isinstance(value, dict):
-        flattened = []
-        for key in (
-            "questions",
-            "question",
-            "content",
-            "items",
-            "suggested_questions",
-        ):
-            if key in value:
-                flattened.extend(flatten_strings(value[key]))
-        return flattened
-
-    serialized = serialize_value(value)
-    if isinstance(serialized, (str, list, dict)):
-        return flatten_strings(serialized)
-    return []
-
-
-def summarize_error(error: Any) -> str | None:
-    payload = serialize_value(error)
-    if isinstance(payload, str):
-        text = payload.strip()
-        return text or None
-
-    if isinstance(payload, dict):
-        for key in ("message", "error_message", "detail", "details"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-    return None
-
-
-def error_type(error: Any) -> str | None:
-    payload = serialize_value(error)
-    if isinstance(payload, dict):
-        for key in ("error_type", "type", "error_code"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def deduplicate(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    unique_items: list[str] = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            unique_items.append(item)
-    return unique_items
-
-
-def build_row(columns: list[str], row: list[Any]) -> dict[str, Any]:
-    row_dict: dict[str, Any] = {}
-    for index, value in enumerate(row):
-        column_name = columns[index] if index < len(columns) else f"column_{index + 1}"
-        row_dict[column_name] = value
-
-    for index in range(len(row), len(columns)):
-        row_dict[columns[index]] = None
-
-    return row_dict
-
-
-def fetch_query_preview(
-    client: WorkspaceClient,
-    *,
-    space_id: str,
-    conversation_id: str,
-    message_id: str,
-    attachment_id: str,
-) -> dict[str, Any]:
-    try:
-        response = client.genie.get_message_attachment_query_result(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc)}
-
-    statement = getattr(response, "statement_response", None)
-    manifest = getattr(statement, "manifest", None)
-    schema = getattr(manifest, "schema", None)
-    column_defs = getattr(schema, "columns", None) or []
-    columns = [
-        getattr(column, "name", None) or f"column_{index + 1}"
-        for index, column in enumerate(column_defs)
-    ]
-
-    result = getattr(statement, "result", None)
-    data_array = getattr(result, "data_array", None) or []
-    preview_rows = [build_row(columns, row) for row in data_array[:PREVIEW_ROW_LIMIT]]
-
-    return {
-        "rows": preview_rows,
-        "chunk_row_count": getattr(result, "row_count", None),
-        "total_row_count": getattr(manifest, "total_row_count", None),
-        "truncated": bool(getattr(manifest, "truncated", False)),
-        "has_more_rows": getattr(result, "next_chunk_index", None) is not None,
-        "uses_external_links": bool(getattr(result, "external_links", None)),
-        "statement_id": getattr(statement, "statement_id", None),
-    }
-
-
-def build_assistant_message(
-    client: WorkspaceClient,
-    *,
-    space_id: str,
-    response: Any,
-) -> dict[str, Any]:
-    attachments = getattr(response, "attachments", None) or []
-    text_parts: list[str] = []
-    sql_blocks: list[dict[str, Any]] = []
-    suggested_questions: list[str] = []
-    conversation_id = conversation_id_for(response)
-    message_id = message_id_for(response)
-
-    for attachment in attachments:
-        text = getattr(getattr(attachment, "text", None), "content", None)
-        if text:
-            text_parts.append(text.strip())
-
-        query_attachment = getattr(attachment, "query", None)
-        query = getattr(query_attachment, "query", None)
-        attachment_id = getattr(attachment, "attachment_id", None)
-        if query:
-            block: dict[str, Any] = {
-                "title": getattr(query_attachment, "title", None) or "Generated SQL",
-                "description": getattr(query_attachment, "description", None),
-                "query": query,
-                "attachment_id": attachment_id,
-            }
-            if conversation_id and message_id and attachment_id:
-                block["preview"] = fetch_query_preview(
-                    client,
-                    space_id=space_id,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                    attachment_id=attachment_id,
-                )
-            sql_blocks.append(block)
-
-        suggested_questions.extend(
-            flatten_strings(getattr(attachment, "suggested_questions", None))
-        )
-
-    content = "\n\n".join(part for part in text_parts if part).strip()
-    error_summary = summarize_error(getattr(response, "error", None))
-    error_kind = error_type(getattr(response, "error", None))
-
-    if not content and error_summary:
-        content = error_summary
-    if not content and error_kind:
-        content = f"Genie returned an error: {error_kind}"
-    if not content and sql_blocks:
-        content = (
-            "Genie generated SQL for this request. Expand the section below to "
-            "inspect the query and preview the result."
-        )
-    if not content:
-        content = "Genie completed the request but did not return a text summary."
-
-    return {
-        "role": "assistant",
-        "content": content,
-        "status": serialize_value(getattr(response, "status", None)),
-        "error": serialize_value(getattr(response, "error", None)),
-        "error_type": error_kind,
-        "conversation_id": conversation_id,
-        "message_id": message_id,
-        "sql_blocks": sql_blocks,
-        "suggestions": deduplicate(suggested_questions)[:4],
-    }
-
-
-def fetch_failed_message(
-    client: WorkspaceClient,
-    *,
-    space_id: str,
-    conversation_id: str | None,
-    message_id: str | None,
-) -> Any | None:
-    if not conversation_id or not message_id:
-        return None
-
-    try:
-        return client.genie.get_message(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-        )
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def ask_genie(prompt: str) -> dict[str, Any]:
-    space_id = os.getenv(SPACE_ID_ENV, "").strip()
-    if not space_id:
-        raise RuntimeError(
-            "GENIE_SPACE_ID is not set. Add a Genie space resource to the "
-            "Databricks app and expose it in app.yaml."
-        )
-
-    client = get_workspace_client()
-    conversation_id = st.session_state.get("conversation_id")
-
-    if conversation_id:
-        waiter = client.genie.create_message(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            content=prompt,
-        )
-    else:
-        waiter = client.genie.start_conversation(
-            space_id=space_id,
-            content=prompt,
-        )
-
-    waiter_conversation_id = getattr(waiter, "conversation_id", None) or conversation_id
-    waiter_message_id = getattr(waiter, "message_id", None)
-
-    if waiter_conversation_id:
-        st.session_state["conversation_id"] = waiter_conversation_id
-
-    try:
-        response = waiter.result(timeout=REQUEST_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001
-        failed_response = fetch_failed_message(
-            client,
-            space_id=space_id,
-            conversation_id=waiter_conversation_id,
-            message_id=waiter_message_id,
-        )
-        if failed_response is not None:
-            return build_assistant_message(
-                client,
-                space_id=space_id,
-                response=failed_response,
-            )
-        raise RuntimeError(str(exc)) from exc
-
-    new_conversation_id = conversation_id_for(response)
-    if new_conversation_id:
-        st.session_state["conversation_id"] = new_conversation_id
-
-    return build_assistant_message(client, space_id=space_id, response=response)
-
-
 def queue_prompt(prompt: str) -> None:
     st.session_state["pending_prompt"] = prompt
 
 
-def render_query_block(block: dict[str, Any], block_index: int) -> None:
-    expander_label = block.get("title") or f"Generated SQL {block_index + 1}"
-    with st.expander(expander_label, expanded=False):
-        description = block.get("description")
-        if description:
-            st.caption(description)
+def chat_history_for_agent() -> list[dict[str, str]]:
+    history: list[dict[str, str]] = []
+    for message in st.session_state["messages"]:
+        role = message.get("role")
+        content = message.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+            history.append({"role": role, "content": content.strip()})
+    return history
 
-        st.code(block.get("query", ""), language="sql")
 
-        preview = block.get("preview")
-        if not preview:
-            return
+def build_invocation_payload(messages: list[dict[str, str]]) -> dict[str, Any]:
+    request_format = os.getenv(REQUEST_FORMAT_ENV, DEFAULT_REQUEST_FORMAT).strip().lower()
+    latest_prompt = messages[-1]["content"] if messages else ""
 
-        if preview.get("error"):
-            st.warning(f"Could not load a result preview: {preview['error']}")
-            return
+    if request_format in {"responses", "response"}:
+        return {"input": messages}
+    if request_format in {"chat", "messages", "chat-completions"}:
+        return {"messages": messages}
+    if request_format in {"inputs", "prompt"}:
+        return {"inputs": {"prompt": latest_prompt, "messages": messages}}
 
-        total_row_count = preview.get("total_row_count")
-        preview_notes: list[str] = []
-        if total_row_count is not None:
-            preview_notes.append(f"{total_row_count} total row(s)")
-        if preview.get("truncated"):
-            preview_notes.append("Result is truncated")
-        if preview.get("has_more_rows") or preview.get("uses_external_links"):
-            preview_notes.append("Showing only the first available result chunk")
-        if preview_notes:
-            st.caption(" | ".join(preview_notes))
+    raise RuntimeError(
+        f"Unsupported {REQUEST_FORMAT_ENV} value `{request_format}`. "
+        "Use `responses`, `chat`, or `inputs`."
+    )
 
-        rows = preview.get("rows") or []
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-            return
 
-        if total_row_count == 0:
-            st.caption("The query completed, but no rows were returned.")
-            return
+def invoke_serving_endpoint(endpoint_name: str, payload: dict[str, Any]) -> Any:
+    client = get_workspace_client()
+    query_client = getattr(client, "serving_endpoints_data_plane", None)
+    if query_client is None:
+        query_client = client.serving_endpoints
 
-        st.caption(
-            "A preview table is not available for this response. Open the SQL in "
-            "Databricks if you need the full result."
+    try:
+        return query_client.query(name=endpoint_name, **payload)
+    except TypeError:
+        path = f"/serving-endpoints/{endpoint_name}/invocations"
+        return client.api_client.do("POST", path, body=payload)
+
+
+def first_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            text = first_text(item)
+            if text:
+                return text
+        return ""
+    if not isinstance(value, dict):
+        return first_text(serialize_value(value))
+
+    for key in ("output_text", "text", "content", "answer", "response", "prediction"):
+        text = first_text(value.get(key))
+        if text:
+            return text
+
+    choices = value.get("choices")
+    if isinstance(choices, list) and choices:
+        for choice in choices:
+            text = first_text(choice.get("message") if isinstance(choice, dict) else choice)
+            if text:
+                return text
+
+    output = value.get("output")
+    if isinstance(output, list):
+        output_parts: list[str] = []
+        for item in output:
+            if isinstance(item, dict):
+                for content_item in item.get("content", []):
+                    text = first_text(content_item)
+                    if text:
+                        output_parts.append(text)
+            else:
+                text = first_text(item)
+                if text:
+                    output_parts.append(text)
+        if output_parts:
+            return "\n\n".join(output_parts)
+
+    predictions = value.get("predictions")
+    if isinstance(predictions, list) and predictions:
+        return first_text(predictions)
+
+    return ""
+
+
+def extract_suggestions(response: Any) -> list[str]:
+    payload = serialize_value(response)
+    if not isinstance(payload, dict):
+        return []
+
+    raw_suggestions = (
+        payload.get("suggestions")
+        or payload.get("suggested_questions")
+        or payload.get("follow_up_questions")
+        or []
+    )
+    if not isinstance(raw_suggestions, list):
+        return []
+
+    suggestions: list[str] = []
+    for item in raw_suggestions:
+        if isinstance(item, str) and item.strip():
+            suggestions.append(item.strip())
+    return suggestions[:4]
+
+
+def build_assistant_message(response: Any) -> dict[str, Any]:
+    payload = serialize_value(response)
+    content = first_text(payload)
+    if not content:
+        content = "The supervisor agent completed the request but did not return text."
+
+    return {
+        "role": "assistant",
+        "content": content,
+        "raw_response": payload,
+        "suggestions": extract_suggestions(payload),
+    }
+
+
+def ask_agent() -> dict[str, Any]:
+    endpoint_name = os.getenv(ENDPOINT_ENV, "").strip()
+    if not endpoint_name:
+        raise RuntimeError(
+            f"{ENDPOINT_ENV} is not set. Add a serving endpoint resource to the "
+            "Databricks app and expose it in app.yaml."
         )
+
+    messages = chat_history_for_agent()
+    payload = build_invocation_payload(messages)
+    response = invoke_serving_endpoint(endpoint_name, payload)
+    st.session_state["last_raw_response"] = serialize_value(response)
+    return build_assistant_message(response)
 
 
 def render_assistant_message(message: dict[str, Any], message_index: int) -> None:
     st.markdown(message["content"])
-
-    if message.get("status") and message.get("status") != "COMPLETED":
-        st.caption(f"Message status: {message['status']}")
-
-    if message.get("error_type"):
-        st.caption(f"Error type: `{message['error_type']}`")
-
-    error_message = summarize_error(message.get("error"))
-    if error_message and error_message != message["content"]:
-        st.error(error_message)
-
-    for block_index, block in enumerate(message.get("sql_blocks", [])):
-        render_query_block(block, block_index)
 
     suggestions = message.get("suggestions") or []
     if suggestions:
@@ -481,6 +289,11 @@ def render_assistant_message(message: dict[str, Any], message_index: int) -> Non
             ):
                 queue_prompt(suggestion)
                 st.rerun()
+
+    raw_response = message.get("raw_response")
+    if raw_response:
+        with st.expander("Raw endpoint response", expanded=False):
+            st.json(raw_response)
 
 
 def render_chat_history() -> None:
@@ -509,13 +322,14 @@ def render_auth_debug() -> None:
 
 initialize_state()
 
-space_id = os.getenv(SPACE_ID_ENV, "").strip()
+endpoint_name = os.getenv(ENDPOINT_ENV, "").strip()
 workspace_host = os.getenv("DATABRICKS_HOST", "Not set")
 app_name = os.getenv("DATABRICKS_APP_NAME", "Local development")
+request_format = os.getenv(REQUEST_FORMAT_ENV, DEFAULT_REQUEST_FORMAT).strip() or DEFAULT_REQUEST_FORMAT
 
 with st.sidebar:
-    st.title("Genie Chat")
-    st.caption("A Streamlit app for Databricks Apps backed by a Genie space resource.")
+    st.title("Supervisor Agent")
+    st.caption("A Streamlit app for Databricks Apps backed by a serving endpoint resource.")
 
     if st.button("Start new conversation", use_container_width=True):
         reset_chat()
@@ -525,10 +339,11 @@ with st.sidebar:
     st.write(f"App: `{app_name}`")
     st.write(f"Workspace: `{workspace_host}`")
     st.write(f"Auth mode: `{get_auth_mode()}`")
-    if space_id:
-        st.success(f"Genie space ready: `{space_id}`")
+    st.write(f"Request format: `{request_format}`")
+    if endpoint_name:
+        st.success(f"Serving endpoint ready: `{endpoint_name}`")
     else:
-        st.error("GENIE_SPACE_ID is missing")
+        st.error(f"{ENDPOINT_ENV} is missing")
 
     render_auth_debug()
 
@@ -538,27 +353,23 @@ with st.sidebar:
             queue_prompt(prompt)
             st.rerun()
 
-st.title("Chat with Genie")
-st.caption(
-    "Ask a business question, keep the conversation going, and inspect the SQL "
-    "that Genie generates for each answer."
-)
+st.title("Chat with Supervisor Agent")
+st.caption("Ask a question and keep the conversation going through your Databricks serving endpoint.")
 
-if not space_id:
+if not endpoint_name:
     st.error(
-        "This app needs a Databricks Apps Genie space resource. Add the resource "
-        "in the app configuration and map it to `GENIE_SPACE_ID` in `app.yaml`."
+        "This app needs a Databricks Apps serving endpoint resource. Add the resource "
+        f"in the app configuration and map it to `{ENDPOINT_ENV}` in `app.yaml`."
     )
     st.info(
-        "Resource key expected by this sample: `genie-space`. Make sure the app "
-        "has user authorization enabled and that signed-in users have the required "
-        "Unity Catalog privileges on the underlying data."
+        "Resource key expected by this sample: `serving-endpoint`. Grant the app "
+        "`Can query` on the endpoint."
     )
     st.stop()
 
 render_chat_history()
 
-submitted_prompt = st.chat_input("Ask a question about your data")
+submitted_prompt = st.chat_input("Ask your supervisor agent")
 queued_prompt = st.session_state.pop("pending_prompt", None)
 prompt = queued_prompt or submitted_prompt
 
@@ -570,18 +381,14 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Genie is working on it..."):
+        with st.spinner("Supervisor agent is working on it..."):
             try:
-                assistant_message = ask_genie(prompt)
+                assistant_message = ask_agent()
             except Exception as exc:  # noqa: BLE001
                 assistant_message = {
                     "role": "assistant",
-                    "content": (
-                        "I could not complete that request against the Genie space."
-                    ),
-                    "status": "FAILED",
-                    "error": str(exc),
-                    "sql_blocks": [],
+                    "content": "I could not complete that request against the serving endpoint.",
+                    "raw_response": {"error": str(exc)},
                     "suggestions": [],
                 }
 
