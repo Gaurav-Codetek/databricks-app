@@ -339,6 +339,7 @@ with st.sidebar:
     st.write(f"App: `{app_name}`")
     st.write(f"Workspace: `{workspace_host}`")
     st.write(f"Auth mode: `{get_auth_mode()}`")
+    st.write("Endpoint caller: `user-authorization` when a user token is present")
     st.write(f"Request format: `{request_format}`")
     if endpoint_name:
         st.success(f"Serving endpoint ready: `{endpoint_name}`")
