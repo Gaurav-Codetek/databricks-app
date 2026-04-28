@@ -12,3 +12,7 @@ env:
     value: responses
   - name: STREAMLIT_GATHER_USAGE_STATS
     value: "false"
+
+permissions:
+  scopes:
+    - model-serving

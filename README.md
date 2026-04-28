@@ -70,7 +70,9 @@ $env:DATABRICKS_CLIENT_SECRET="<oauth-client-secret>"
 4. In the app configuration step, add a **Serving endpoint** resource.
 5. Grant the app `Can query` on the endpoint.
 6. Use the default resource key `serving-endpoint`, or update `app.yaml` if you choose a different key.
-7. Deploy or restart the app after changing resource configuration.
+7. Under **User authorization**, include the `model-serving` scope.
+8. Deploy or restart the app after changing resource configuration.
+9. Re-consent to the app if Databricks prompts after the scope change.
 
 ## Required permissions
 
