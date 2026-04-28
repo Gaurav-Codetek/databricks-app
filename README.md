@@ -12,9 +12,8 @@ This repository contains a simple Streamlit chat application designed for deploy
 
 - You add a serving endpoint as an app resource in the Databricks Apps UI.
 - `app.yaml` maps that resource to `SERVING_ENDPOINT` using `valueFrom: serving-endpoint`.
-- In Databricks Apps, the Streamlit app prefers user authorization by reading the forwarded `x-forwarded-access-token` header.
-- If no forwarded user token is available, the app falls back to the app service principal credentials injected by Databricks Apps.
-- Serving endpoint calls use user authorization when Databricks forwards a signed-in user's token. If no user token is present, the app falls back to app authorization.
+- In Databricks Apps, the Streamlit app uses user authorization by reading the forwarded `x-forwarded-access-token` header.
+- Serving endpoint calls use the signed-in user's forwarded Databricks Apps token directly. If no user token is present, the request fails instead of falling back to app credentials.
 - The app posts chat history to `/serving-endpoints/<endpoint-name>/invocations`.
 
 By default, requests use the Databricks agent `ResponsesAgent` style payload:
@@ -82,3 +81,5 @@ The app service principal typically needs:
 - any downstream data or tool permissions required by the deployed supervisor agent itself
 
 Signed-in users need access to the app, the `model-serving` user authorization scope, and permission to query the endpoint. If the agent uses downstream Databricks resources, users also need the relevant permissions for those resources.
+
+Avoid manually setting `DATABRICKS_TOKEN`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`, or `DATABRICKS_CONFIG_PROFILE` for user-authorized endpoint calls. The app reads the forwarded user token from Databricks Apps request headers.

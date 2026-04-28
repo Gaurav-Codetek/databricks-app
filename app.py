@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import quote
 
+import requests
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 
@@ -29,7 +31,10 @@ def get_forwarded_user_token() -> str:
     if not headers:
         return ""
 
-    token = headers.get("x-forwarded-access-token", "")
+    token = (
+        headers.get("x-forwarded-access-token", "")
+        or headers.get("X-Forwarded-Access-Token", "")
+    )
     return token.strip() if token else ""
 
 
@@ -162,16 +167,40 @@ def build_invocation_payload(messages: list[dict[str, str]]) -> dict[str, Any]:
 
 
 def invoke_serving_endpoint(endpoint_name: str, payload: dict[str, Any]) -> Any:
-    client = get_workspace_client()
-    query_client = getattr(client, "serving_endpoints_data_plane", None)
-    if query_client is None:
-        query_client = client.serving_endpoints
+    host = os.getenv("DATABRICKS_HOST", "").strip().rstrip("/")
+    if not host:
+        raise RuntimeError("DATABRICKS_HOST is not set.")
+
+    token = get_forwarded_user_token()
+    if not token:
+        raise RuntimeError(
+            "No forwarded user token was found. Enable Databricks Apps user "
+            "authorization and grant the `model-serving` scope."
+        )
+
+    endpoint_path = quote(endpoint_name, safe="")
+    response = requests.post(
+        f"{host}/serving-endpoints/{endpoint_path}/invocations",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=180,
+    )
 
     try:
-        return query_client.query(name=endpoint_name, **payload)
-    except TypeError:
-        path = f"/serving-endpoints/{endpoint_name}/invocations"
-        return client.api_client.do("POST", path, body=payload)
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text
+
+    if response.ok:
+        return response_payload
+
+    raise RuntimeError(
+        f"Serving endpoint request failed with HTTP {response.status_code}: "
+        f"{response_payload}"
+    )
 
 
 def first_text(value: Any) -> str:
