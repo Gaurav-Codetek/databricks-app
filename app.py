@@ -170,6 +170,8 @@ def invoke_serving_endpoint(endpoint_name: str, payload: dict[str, Any]) -> Any:
     host = os.getenv("DATABRICKS_HOST", "").strip().rstrip("/")
     if not host:
         raise RuntimeError("DATABRICKS_HOST is not set.")
+    if not host.startswith(("http://", "https://")):
+        host = f"https://{host}"
 
     token = get_forwarded_user_token()
     if not token:
