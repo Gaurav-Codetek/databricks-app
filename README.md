@@ -19,6 +19,7 @@ It also includes a Lakebase browser tab for previewing rows from synced Postgres
 - Serving endpoint calls use the signed-in user's forwarded Databricks Apps token directly. If no user token is present, the request fails instead of falling back to app credentials.
 - The app posts chat history to `/serving-endpoints/<endpoint-name>/invocations`.
 - The Lakebase tab uses the app service principal and Databricks-generated database credentials to list Postgres tables and preview rows.
+- Synced Lakebase tables are queried as Postgres tables, for example `silver_pharma_sales.synced_silver_pharm...`, not as Unity Catalog three-part names.
 
 By default, requests use the Databricks agent `ResponsesAgent` style payload:
 
@@ -92,3 +93,5 @@ The app service principal typically needs:
 Signed-in users need access to the app, the `model-serving` user authorization scope, and permission to query the endpoint. If the agent uses downstream Databricks resources, users also need the relevant permissions for those resources.
 
 Avoid manually setting `DATABRICKS_TOKEN`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`, or `DATABRICKS_CONFIG_PROFILE` for user-authorized endpoint calls. The app reads the forwarded user token from Databricks Apps request headers.
+
+For Lakebase, the app reads standard Postgres variables such as `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and optionally `PGPASSWORD`. If `PGPASSWORD` is not provided, it uses the attached Lakebase resource key `postgres` to generate a database credential.

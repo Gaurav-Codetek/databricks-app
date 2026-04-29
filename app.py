@@ -215,11 +215,18 @@ def invoke_serving_endpoint(endpoint_name: str, payload: dict[str, Any]) -> Any:
 class OAuthConnection(psycopg.Connection):
     @classmethod
     def connect(cls, conninfo: str = "", **kwargs: Any) -> "OAuthConnection":
+        password = os.getenv("PGPASSWORD", "").strip()
+        if password:
+            kwargs["password"] = password
+            return super().connect(conninfo, **kwargs)
+
         endpoint_name = os.getenv(LAKEBASE_ENDPOINT_ENV, "").strip()
         if not endpoint_name:
             raise RuntimeError(
+                "PGPASSWORD is not set and "
                 f"{LAKEBASE_ENDPOINT_ENV} is not set. Add a Databricks Apps "
-                "Database resource with resource key `postgres`."
+                "Database resource with resource key `postgres`, or provide "
+                "standard Postgres connection environment variables."
             )
 
         credential = WorkspaceClient().postgres.generate_database_credential(
@@ -235,6 +242,7 @@ def lakebase_connection_info() -> dict[str, str]:
         "host": os.getenv("PGHOST", "").strip(),
         "database": os.getenv("PGDATABASE", "").strip(),
         "user": os.getenv("PGUSER", "").strip(),
+        "password": os.getenv("PGPASSWORD", "").strip(),
         "port": os.getenv("PGPORT", "5432").strip() or "5432",
         "sslmode": os.getenv("PGSSLMODE", "require").strip() or "require",
     }
@@ -242,7 +250,9 @@ def lakebase_connection_info() -> dict[str, str]:
 
 def lakebase_is_configured() -> bool:
     info = lakebase_connection_info()
-    return all(info[key] for key in ("endpoint", "host", "database", "user"))
+    has_connection = all(info[key] for key in ("host", "database", "user"))
+    has_auth = bool(info["password"] or info["endpoint"])
+    return has_connection and has_auth
 
 
 @st.cache_resource(show_spinner=False)
@@ -271,6 +281,9 @@ def get_lakebase_pool(
 def get_configured_lakebase_pool() -> ConnectionPool:
     info = lakebase_connection_info()
     missing = [key for key in ("endpoint", "host", "database", "user") if not info[key]]
+    if info["password"]:
+        missing = [key for key in ("host", "database", "user") if not info[key]]
+
     if missing:
         raise RuntimeError(
             "Lakebase is missing required environment variables: "
