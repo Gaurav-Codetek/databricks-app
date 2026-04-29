@@ -8,6 +8,8 @@ command:
 env:
   - name: SERVING_ENDPOINT
     valueFrom: serving-endpoint
+  - name: LAKEBASE_ENDPOINT_NAME
+    valueFrom: postgres
   - name: AGENT_REQUEST_FORMAT
     value: responses
   - name: STREAMLIT_GATHER_USAGE_STATS

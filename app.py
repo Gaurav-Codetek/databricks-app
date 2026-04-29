@@ -4,14 +4,21 @@ import os
 from typing import Any
 from urllib.parse import quote
 
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 import requests
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 
 
 ENDPOINT_ENV = "SERVING_ENDPOINT"
+LAKEBASE_ENDPOINT_ENV = "LAKEBASE_ENDPOINT_NAME"
 REQUEST_FORMAT_ENV = "AGENT_REQUEST_FORMAT"
 DEFAULT_REQUEST_FORMAT = "responses"
+DEFAULT_LAKEBASE_SCHEMA = "public"
+DEFAULT_LAKEBASE_ROW_LIMIT = 50
 DEFAULT_PROMPTS = [
     "Summarize current business performance.",
     "What should I look at first today?",
@@ -205,6 +212,108 @@ def invoke_serving_endpoint(endpoint_name: str, payload: dict[str, Any]) -> Any:
     )
 
 
+class OAuthConnection(psycopg.Connection):
+    @classmethod
+    def connect(cls, conninfo: str = "", **kwargs: Any) -> "OAuthConnection":
+        endpoint_name = os.getenv(LAKEBASE_ENDPOINT_ENV, "").strip()
+        if not endpoint_name:
+            raise RuntimeError(
+                f"{LAKEBASE_ENDPOINT_ENV} is not set. Add a Databricks Apps "
+                "Database resource with resource key `postgres`."
+            )
+
+        credential = WorkspaceClient().postgres.generate_database_credential(
+            endpoint=endpoint_name
+        )
+        kwargs["password"] = credential.token
+        return super().connect(conninfo, **kwargs)
+
+
+def lakebase_connection_info() -> dict[str, str]:
+    return {
+        "endpoint": os.getenv(LAKEBASE_ENDPOINT_ENV, "").strip(),
+        "host": os.getenv("PGHOST", "").strip(),
+        "database": os.getenv("PGDATABASE", "").strip(),
+        "user": os.getenv("PGUSER", "").strip(),
+        "port": os.getenv("PGPORT", "5432").strip() or "5432",
+        "sslmode": os.getenv("PGSSLMODE", "require").strip() or "require",
+    }
+
+
+def lakebase_is_configured() -> bool:
+    info = lakebase_connection_info()
+    return all(info[key] for key in ("endpoint", "host", "database", "user"))
+
+
+@st.cache_resource(show_spinner=False)
+def get_lakebase_pool(
+    endpoint_name: str,
+    host: str,
+    database: str,
+    user: str,
+    port: str,
+    sslmode: str,
+) -> ConnectionPool:
+    _ = endpoint_name
+    conninfo = (
+        f"dbname={database} user={user} host={host} port={port} sslmode={sslmode}"
+    )
+    return ConnectionPool(
+        conninfo=conninfo,
+        connection_class=OAuthConnection,
+        kwargs={"row_factory": dict_row},
+        min_size=1,
+        max_size=5,
+        open=True,
+    )
+
+
+def get_configured_lakebase_pool() -> ConnectionPool:
+    info = lakebase_connection_info()
+    missing = [key for key in ("endpoint", "host", "database", "user") if not info[key]]
+    if missing:
+        raise RuntimeError(
+            "Lakebase is missing required environment variables: "
+            + ", ".join(missing)
+        )
+
+    return get_lakebase_pool(
+        info["endpoint"],
+        info["host"],
+        info["database"],
+        info["user"],
+        info["port"],
+        info["sslmode"],
+    )
+
+
+def fetch_lakebase_tables() -> list[dict[str, Any]]:
+    pool = get_configured_lakebase_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_schema, table_name, table_type
+                FROM information_schema.tables
+                WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY table_schema, table_name
+                """
+            )
+            return list(cur.fetchall())
+
+
+def fetch_lakebase_rows(schema_name: str, table_name: str, limit: int) -> list[dict[str, Any]]:
+    pool = get_configured_lakebase_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            query = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
+                sql.Identifier(schema_name),
+                sql.Identifier(table_name),
+            )
+            cur.execute(query, (limit,))
+            return list(cur.fetchall())
+
+
 def first_text(value: Any) -> str:
     if value is None:
         return ""
@@ -351,12 +460,72 @@ def render_auth_debug() -> None:
         st.error(f"Error fetching identity: {exc}")
 
 
+def render_lakebase_browser() -> None:
+    st.subheader("Lakebase Items")
+
+    info = lakebase_connection_info()
+    connection_cols = st.columns(4)
+    connection_cols[0].metric("Database", info["database"] or "Missing")
+    connection_cols[1].metric("Host", info["host"] or "Missing")
+    connection_cols[2].metric("User", info["user"] or "Missing")
+    connection_cols[3].metric("Endpoint", "Ready" if info["endpoint"] else "Missing")
+
+    if not lakebase_is_configured():
+        st.warning(
+            "Lakebase is not configured yet. Add a Database resource with resource "
+            "key `postgres`, then redeploy the app."
+        )
+        return
+
+    try:
+        tables = fetch_lakebase_tables()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not fetch Lakebase tables: {exc}")
+        return
+
+    if tables:
+        table_options = [
+            f"{table['table_schema']}.{table['table_name']}" for table in tables
+        ]
+        selected_table = st.selectbox("Synced table", table_options)
+        selected_schema, selected_name = selected_table.split(".", 1)
+    else:
+        st.info("No Lakebase tables were found. You can still try a manual table name.")
+        selected_schema = st.text_input("Schema", value=DEFAULT_LAKEBASE_SCHEMA)
+        selected_name = st.text_input("Table")
+
+    row_limit = st.number_input(
+        "Rows to fetch",
+        min_value=1,
+        max_value=500,
+        value=DEFAULT_LAKEBASE_ROW_LIMIT,
+        step=10,
+    )
+
+    if st.button("Fetch Lakebase items", use_container_width=False):
+        if not selected_schema or not selected_name:
+            st.error("Enter a schema and table name.")
+            return
+
+        try:
+            rows = fetch_lakebase_rows(selected_schema, selected_name, int(row_limit))
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not fetch rows from {selected_schema}.{selected_name}: {exc}")
+            return
+
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"{selected_schema}.{selected_name} returned no rows.")
+
+
 initialize_state()
 
 endpoint_name = os.getenv(ENDPOINT_ENV, "").strip()
 workspace_host = os.getenv("DATABRICKS_HOST", "Not set")
 app_name = os.getenv("DATABRICKS_APP_NAME", "Local development")
 request_format = os.getenv(REQUEST_FORMAT_ENV, DEFAULT_REQUEST_FORMAT).strip() or DEFAULT_REQUEST_FORMAT
+lakebase_endpoint_name = os.getenv(LAKEBASE_ENDPOINT_ENV, "").strip()
 
 with st.sidebar:
     st.title("Supervisor Agent")
@@ -376,6 +545,10 @@ with st.sidebar:
         st.success(f"Serving endpoint ready: `{endpoint_name}`")
     else:
         st.error(f"{ENDPOINT_ENV} is missing")
+    if lakebase_endpoint_name:
+        st.success("Lakebase resource ready: `postgres`")
+    else:
+        st.warning(f"{LAKEBASE_ENDPOINT_ENV} is missing")
 
     render_auth_debug()
 
@@ -385,48 +558,54 @@ with st.sidebar:
             queue_prompt(prompt)
             st.rerun()
 
-st.title("Chat with Supervisor Agent")
-st.caption("Ask a question and keep the conversation going through your Databricks serving endpoint.")
+chat_tab, lakebase_tab = st.tabs(["Supervisor Agent", "Lakebase"])
 
-if not endpoint_name:
-    st.error(
-        "This app needs a Databricks Apps serving endpoint resource. Add the resource "
-        f"in the app configuration and map it to `{ENDPOINT_ENV}` in `app.yaml`."
-    )
-    st.info(
-        "Resource key expected by this sample: `serving-endpoint`. Grant the app "
-        "`Can query` on the endpoint."
-    )
-    st.stop()
+with lakebase_tab:
+    render_lakebase_browser()
 
-render_chat_history()
+with chat_tab:
+    st.title("Chat with Supervisor Agent")
+    st.caption("Ask a question and keep the conversation going through your Databricks serving endpoint.")
 
-submitted_prompt = st.chat_input("Ask your supervisor agent")
-queued_prompt = st.session_state.pop("pending_prompt", None)
-prompt = queued_prompt or submitted_prompt
-
-if prompt:
-    user_message = {"role": "user", "content": prompt}
-    st.session_state["messages"].append(user_message)
-
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Supervisor agent is working on it..."):
-            try:
-                assistant_message = ask_agent()
-            except Exception as exc:  # noqa: BLE001
-                assistant_message = {
-                    "role": "assistant",
-                    "content": "I could not complete that request against the serving endpoint.",
-                    "raw_response": {"error": str(exc)},
-                    "suggestions": [],
-                }
-
-        render_assistant_message(
-            assistant_message,
-            len(st.session_state["messages"]),
+    if not endpoint_name:
+        st.error(
+            "This app needs a Databricks Apps serving endpoint resource. Add the resource "
+            f"in the app configuration and map it to `{ENDPOINT_ENV}` in `app.yaml`."
         )
+        st.info(
+            "Resource key expected by this sample: `serving-endpoint`. Grant the app "
+            "`Can query` on the endpoint."
+        )
+        st.stop()
 
-    st.session_state["messages"].append(assistant_message)
+    render_chat_history()
+
+    submitted_prompt = st.chat_input("Ask your supervisor agent")
+    queued_prompt = st.session_state.pop("pending_prompt", None)
+    prompt = queued_prompt or submitted_prompt
+
+    if prompt:
+        user_message = {"role": "user", "content": prompt}
+        st.session_state["messages"].append(user_message)
+
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Supervisor agent is working on it..."):
+                try:
+                    assistant_message = ask_agent()
+                except Exception as exc:  # noqa: BLE001
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": "I could not complete that request against the serving endpoint.",
+                        "raw_response": {"error": str(exc)},
+                        "suggestions": [],
+                    }
+
+            render_assistant_message(
+                assistant_message,
+                len(st.session_state["messages"]),
+            )
+
+        st.session_state["messages"].append(assistant_message)
