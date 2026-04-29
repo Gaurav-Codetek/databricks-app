@@ -302,15 +302,72 @@ def fetch_lakebase_tables() -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
-def fetch_lakebase_rows(schema_name: str, table_name: str, limit: int) -> list[dict[str, Any]]:
+def fetch_lakebase_columns(schema_name: str, table_name: str) -> list[dict[str, Any]]:
     pool = get_configured_lakebase_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            query = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (schema_name, table_name),
+            )
+            return list(cur.fetchall())
+
+
+def fetch_filtered_lakebase_rows(
+    schema_name: str,
+    table_name: str,
+    column_name: str | None,
+    operator: str,
+    filter_value: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    pool = get_configured_lakebase_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            base_query = sql.SQL("SELECT * FROM {}.{}").format(
                 sql.Identifier(schema_name),
                 sql.Identifier(table_name),
             )
-            cur.execute(query, (limit,))
+            params: list[Any] = []
+
+            if column_name and operator != "No filter":
+                column_sql = sql.Identifier(column_name)
+                if operator == "equals":
+                    where_sql = sql.SQL("{} = %s").format(column_sql)
+                    params.append(filter_value)
+                elif operator == "not equals":
+                    where_sql = sql.SQL("{} <> %s").format(column_sql)
+                    params.append(filter_value)
+                elif operator == "contains":
+                    where_sql = sql.SQL("{}::text ILIKE %s").format(column_sql)
+                    params.append(f"%{filter_value}%")
+                elif operator == "starts with":
+                    where_sql = sql.SQL("{}::text ILIKE %s").format(column_sql)
+                    params.append(f"{filter_value}%")
+                elif operator == "greater than":
+                    where_sql = sql.SQL("{} > %s").format(column_sql)
+                    params.append(filter_value)
+                elif operator == "less than":
+                    where_sql = sql.SQL("{} < %s").format(column_sql)
+                    params.append(filter_value)
+                elif operator == "is null":
+                    where_sql = sql.SQL("{} IS NULL").format(column_sql)
+                elif operator == "is not null":
+                    where_sql = sql.SQL("{} IS NOT NULL").format(column_sql)
+                else:
+                    raise RuntimeError(f"Unsupported filter operator: {operator}")
+
+                base_query = sql.SQL("{} WHERE {}").format(base_query, where_sql)
+
+            query = sql.SQL("{} LIMIT %s").format(base_query)
+            params.append(limit)
+            cur.execute(query, params)
             return list(cur.fetchall())
 
 
@@ -494,6 +551,48 @@ def render_lakebase_browser() -> None:
         selected_schema = st.text_input("Schema", value=DEFAULT_LAKEBASE_SCHEMA)
         selected_name = st.text_input("Table")
 
+    columns: list[dict[str, Any]] = []
+    if selected_schema and selected_name:
+        try:
+            columns = fetch_lakebase_columns(selected_schema, selected_name)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Could not fetch columns for filtering: {exc}")
+
+    st.markdown("#### Filter")
+    filter_cols = st.columns([1.3, 1.1, 1.6])
+    column_options = [""] + [
+        str(column["column_name"]) for column in columns if column.get("column_name")
+    ]
+    selected_column = filter_cols[0].selectbox(
+        "Column",
+        column_options,
+        format_func=lambda value: "No filter" if not value else value,
+    )
+    operator = filter_cols[1].selectbox(
+        "Operator",
+        [
+            "No filter",
+            "equals",
+            "not equals",
+            "contains",
+            "starts with",
+            "greater than",
+            "less than",
+            "is null",
+            "is not null",
+        ],
+        disabled=not selected_column,
+    )
+    value_required = operator not in {"No filter", "is null", "is not null"}
+    filter_value = filter_cols[2].text_input(
+        "Value",
+        disabled=not selected_column or not value_required,
+    )
+
+    if columns:
+        with st.expander("Columns", expanded=False):
+            st.dataframe(columns, use_container_width=True, hide_index=True)
+
     row_limit = st.number_input(
         "Rows to fetch",
         min_value=1,
@@ -506,9 +605,19 @@ def render_lakebase_browser() -> None:
         if not selected_schema or not selected_name:
             st.error("Enter a schema and table name.")
             return
+        if selected_column and value_required and not filter_value:
+            st.error("Enter a filter value.")
+            return
 
         try:
-            rows = fetch_lakebase_rows(selected_schema, selected_name, int(row_limit))
+            rows = fetch_filtered_lakebase_rows(
+                selected_schema,
+                selected_name,
+                selected_column or None,
+                operator,
+                filter_value,
+                int(row_limit),
+            )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Could not fetch rows from {selected_schema}.{selected_name}: {exc}")
             return
