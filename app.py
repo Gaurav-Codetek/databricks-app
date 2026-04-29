@@ -302,65 +302,28 @@ def fetch_lakebase_tables() -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
+def fetch_lakebase_schemas() -> list[str]:
+    pool = get_configured_lakebase_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+                  AND schema_name NOT LIKE 'pg_toast%'
+                ORDER BY schema_name
+                """
+            )
+            return [row["schema_name"] for row in cur.fetchall()]
+
+
 def fetch_synced_table_managers() -> list[dict[str, Any]]:
     pool = get_configured_lakebase_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM databricks_synced_table_managers")
             return list(cur.fetchall())
-
-
-def normalize_table_ref(value: Any) -> tuple[str, str] | None:
-    if value is None:
-        return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    # Postgres regclass values can look like public.table or "my_schema"."my_table".
-    text = text.replace('"."', ".").replace('"', "")
-    parts = [part.strip() for part in text.split(".") if part.strip()]
-    if len(parts) < 2:
-        return None
-
-    return parts[-2], parts[-1]
-
-
-def synced_tables_from_managers(
-    manager_rows: list[dict[str, Any]],
-    known_tables: set[tuple[str, str]] | None = None,
-) -> list[tuple[str, str]]:
-    table_refs: set[tuple[str, str]] = set()
-    preferred_columns = (
-        "table",
-        "synced_table",
-        "synced_table_name",
-        "table_name",
-        "relname",
-    )
-
-    for row in manager_rows:
-        row_refs: set[tuple[str, str]] = set()
-        normalized_row = {key.lower(): value for key, value in row.items()}
-        for column_name in preferred_columns:
-            if column_name in normalized_row:
-                table_ref = normalize_table_ref(normalized_row[column_name])
-                if table_ref:
-                    row_refs.add(table_ref)
-
-        if not row_refs:
-            for value in row.values():
-                table_ref = normalize_table_ref(value)
-                if table_ref:
-                    row_refs.add(table_ref)
-
-        if known_tables is not None:
-            row_refs = {table_ref for table_ref in row_refs if table_ref in known_tables}
-
-        table_refs.update(row_refs)
-
-    return sorted(table_refs)
 
 
 def fetch_lakebase_columns(schema_name: str, table_name: str) -> list[dict[str, Any]]:
@@ -595,13 +558,14 @@ def render_lakebase_browser() -> None:
         )
         return
 
-    manager_rows: list[dict[str, Any]] = []
-    synced_table_refs: list[tuple[str, str]] = []
+    schemas: list[str] = []
     tables: list[dict[str, Any]] = []
+    manager_rows: list[dict[str, Any]] = []
     try:
-        manager_rows = fetch_synced_table_managers()
+        schemas = fetch_lakebase_schemas()
     except Exception as exc:  # noqa: BLE001
-        st.warning(f"Could not fetch synced table managers: {exc}")
+        st.error(f"Could not fetch Lakebase schemas: {exc}")
+        return
 
     try:
         tables = fetch_lakebase_tables()
@@ -609,38 +573,58 @@ def render_lakebase_browser() -> None:
         st.error(f"Could not fetch Lakebase tables: {exc}")
         return
 
-    known_tables = {
-        (str(table["table_schema"]), str(table["table_name"]))
-        for table in tables
-        if table.get("table_schema") and table.get("table_name")
-    }
-    synced_table_refs = synced_tables_from_managers(manager_rows, known_tables)
+    try:
+        manager_rows = fetch_synced_table_managers()
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Synced table manager metadata is not available: {exc}")
 
     if manager_rows:
-        with st.expander("Synced table managers", expanded=True):
+        with st.expander("Synced table managers", expanded=False):
             st.dataframe(manager_rows, use_container_width=True, hide_index=True)
 
     selected_schema = ""
     selected_name = ""
-    if synced_table_refs:
-        table_options = [f"{schema}.{table}" for schema, table in synced_table_refs]
-        selected_table = st.selectbox("Table data to fetch", table_options)
-        selected_schema, selected_name = selected_table.split(".", 1)
-    else:
-        if tables:
-            st.info(
-                "No table references were found in databricks_synced_table_managers, "
-                "so showing regular Lakebase tables instead."
+    if schemas:
+        default_schema_index = (
+            schemas.index("silver_pharma_sales")
+            if "silver_pharma_sales" in schemas
+            else schemas.index(DEFAULT_LAKEBASE_SCHEMA)
+            if DEFAULT_LAKEBASE_SCHEMA in schemas
+            else 0
+        )
+        selected_schema = st.selectbox(
+            "Schema",
+            schemas,
+            index=default_schema_index,
+        )
+
+        schema_tables = [
+            table
+            for table in tables
+            if table.get("table_schema") == selected_schema
+        ]
+        table_options = [str(table["table_name"]) for table in schema_tables]
+        if table_options:
+            default_table_index = next(
+                (
+                    index
+                    for index, table_name in enumerate(table_options)
+                    if table_name.startswith("synced_")
+                ),
+                0,
             )
-            table_options = [
-                f"{table['table_schema']}.{table['table_name']}" for table in tables
-            ]
-            selected_table = st.selectbox("Table data to fetch", table_options)
-            selected_schema, selected_name = selected_table.split(".", 1)
+            selected_name = st.selectbox(
+                "Table data to fetch",
+                table_options,
+                index=default_table_index,
+            )
         else:
-            st.info("No Lakebase tables were found. You can still try a manual table name.")
-            selected_schema = st.text_input("Schema", value=DEFAULT_LAKEBASE_SCHEMA)
+            st.info(f"No tables were found in schema `{selected_schema}`.")
             selected_name = st.text_input("Table")
+    else:
+        st.info("No Lakebase schemas were found. You can still try a manual table name.")
+        selected_schema = st.text_input("Schema", value=DEFAULT_LAKEBASE_SCHEMA)
+        selected_name = st.text_input("Table")
 
     columns: list[dict[str, Any]] = []
     if selected_schema and selected_name:
