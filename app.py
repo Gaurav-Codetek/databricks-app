@@ -318,14 +318,6 @@ def fetch_lakebase_schemas() -> list[str]:
             return [row["schema_name"] for row in cur.fetchall()]
 
 
-def fetch_synced_table_managers() -> list[dict[str, Any]]:
-    pool = get_configured_lakebase_pool()
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM databricks_synced_table_managers")
-            return list(cur.fetchall())
-
-
 def fetch_lakebase_columns(schema_name: str, table_name: str) -> list[dict[str, Any]]:
     pool = get_configured_lakebase_pool()
     with pool.connection() as conn:
@@ -558,9 +550,6 @@ def render_lakebase_browser() -> None:
         )
         return
 
-    schemas: list[str] = []
-    tables: list[dict[str, Any]] = []
-    manager_rows: list[dict[str, Any]] = []
     try:
         schemas = fetch_lakebase_schemas()
     except Exception as exc:  # noqa: BLE001
@@ -572,15 +561,6 @@ def render_lakebase_browser() -> None:
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not fetch Lakebase tables: {exc}")
         return
-
-    try:
-        manager_rows = fetch_synced_table_managers()
-    except Exception as exc:  # noqa: BLE001
-        st.caption(f"Synced table manager metadata is not available: {exc}")
-
-    if manager_rows:
-        with st.expander("Synced table managers", expanded=False):
-            st.dataframe(manager_rows, use_container_width=True, hide_index=True)
 
     selected_schema = ""
     selected_name = ""
@@ -603,6 +583,21 @@ def render_lakebase_browser() -> None:
             for table in tables
             if table.get("table_schema") == selected_schema
         ]
+        show_synced_only = st.checkbox(
+            "Show synced tables only",
+            value=True,
+            disabled=not any(
+                str(table["table_name"]).startswith("synced_")
+                for table in schema_tables
+            ),
+        )
+        if show_synced_only:
+            schema_tables = [
+                table
+                for table in schema_tables
+                if str(table["table_name"]).startswith("synced_")
+            ]
+
         table_options = [str(table["table_name"]) for table in schema_tables]
         if table_options:
             default_table_index = next(
