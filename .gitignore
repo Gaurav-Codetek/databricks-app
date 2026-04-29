@@ -9,4 +9,5 @@ dist/
 build/
 test.py
 export_genie_space.py
+.env
 genie_serialized_space.json
